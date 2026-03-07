@@ -480,27 +480,41 @@ async def get_channel_history(
 
 
 async def _load_channels_to_cache() -> bool:
-    """Load all channels into the cache. Returns True if successful."""
+    """Load all channels into the cache with cursor-based pagination."""
     global _channel_cache
 
     url = f"{SLACK_API_BASE}/conversations.list"
-    payload = {"exclude_archived": "true", "types": "public_channel,private_channel"}
-    data = await make_request(url, method="GET", payload=payload)
+    _channel_cache.clear()
+    cursor = None
 
-    if data and data.get("ok"):
-        channels = data.get("channels", [])
-        _channel_cache.clear()
-        for channel in channels:
+    while True:
+        payload: dict[str, str] = {
+            "exclude_archived": "true",
+            "types": "public_channel,private_channel",
+            "limit": "1000",
+        }
+        if cursor:
+            payload["cursor"] = cursor
+
+        data = await make_request(url, method="GET", payload=payload)
+
+        if not data or not data.get("ok"):
+            error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
+            print(f"Error loading channels to cache: {error_msg}")
+            return False
+
+        for channel in data.get("channels", []):
             channel_name = channel.get("name", "")
             channel_id = channel.get("id", "")
             if channel_name and channel_id:
                 _channel_cache[channel_name] = channel_id
-        print(f"Loaded {len(_channel_cache)} channels into cache")
-        return True
 
-    error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
-    print(f"Error loading channels to cache: {error_msg}")
-    return False
+        cursor = data.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    print(f"Loaded {len(_channel_cache)} channels into cache")
+    return True
 
 
 @mcp.tool()
