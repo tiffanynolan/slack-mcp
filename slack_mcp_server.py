@@ -479,8 +479,34 @@ async def get_channel_history(
     return await asyncio.gather(*[filter_message_fields(msg) for msg in all_messages])
 
 
+async def _search_channels(query: str, only_member: bool = True) -> list[dict[str, str]]:
+    """Search for channels by keyword using search.modules (works on Enterprise Grid).
+    By default only returns channels the user is a member of."""
+    url = f"{SLACK_API_BASE}/search.modules"
+    payload = {"query": query, "module": "channels", "count": 50}
+    data = await make_request(url, payload=payload)
+
+    if not data or not data.get("ok"):
+        return []
+
+    results = []
+    for item in data.get("items", []):
+        ch = item.get("channel", item)
+        if only_member and not ch.get("is_member", False):
+            continue
+        name = ch.get("name", "")
+        cid = ch.get("id", "")
+        if name and cid:
+            results.append({"id": cid, "name": name})
+            _channel_cache[name] = cid
+
+    return results
+
+
 async def _load_channels_to_cache() -> bool:
-    """Load all channels into the cache with cursor-based pagination."""
+    """Load channels into the cache. Uses conversations.list with cursor-based
+    pagination, falling back to search.modules on Enterprise Grid workspaces
+    where conversations.list is restricted."""
     global _channel_cache
 
     url = f"{SLACK_API_BASE}/conversations.list"
@@ -500,7 +526,7 @@ async def _load_channels_to_cache() -> bool:
 
         if not data or not data.get("ok"):
             error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
-            print(f"Error loading channels to cache: {error_msg}")
+            print(f"conversations.list unavailable ({error_msg}), using search.modules fallback")
             return False
 
         for channel in data.get("channels", []):
@@ -529,12 +555,17 @@ async def get_channel_id_by_name(channel_name: str) -> str:
         print(f"Channel '{clean_name}' found in cache")
         return _channel_cache[clean_name]
 
-    # Cache miss - load all channels
+    # Try loading full channel list
     print(f"Cache miss for '{clean_name}', loading channels...")
     if await _load_channels_to_cache():
-        # Check cache again after loading
         if clean_name in _channel_cache:
             return _channel_cache[clean_name]
+
+    # Fallback: search for the channel by name (Enterprise Grid)
+    results = await _search_channels(clean_name)
+    for ch in results:
+        if ch["name"] == clean_name:
+            return ch["id"]
 
     print(f"Channel '{clean_name}' not found")
     return ""
@@ -548,12 +579,19 @@ async def refresh_channel_cache() -> bool:
 
 
 @mcp.tool()
-async def list_channels(query: str = "") -> list[dict[str, str]]:
+async def list_channels(query: str = "", only_member: bool = True) -> list[dict[str, str]]:
     """List channels in the workspace. Optionally filter by keyword (matches against channel name).
-    Returns a list of channels with their ID and name. Use this to find channels when you don't know the exact name."""
-    await log_to_slack(f"Listing channels (query: '{query}')")
+    Returns a list of channels with their ID and name. Use this to find channels when you don't know the exact name.
+    Set only_member=False to include channels you haven't joined."""
+    await log_to_slack(f"Listing channels (query: '{query}', only_member: {only_member})")
 
-    # Ensure cache is populated
+    # If a query is provided, use search.modules directly (works on Enterprise Grid)
+    if query:
+        results = await _search_channels(query, only_member=only_member)
+        if results:
+            return results
+
+    # Fall back to cache-based lookup
     if not _channel_cache:
         await _load_channels_to_cache()
 
