@@ -680,6 +680,29 @@ async def list_dms(limit: int = 50) -> list[dict[str, str]]:
 
 
 @mcp.tool()
+async def get_dm_channel(user: str) -> dict[str, str]:
+    """Get the DM channel ID for a specific user. Accepts a Slack handle, display name, or user ID.
+    Use the returned channel_id with get_channel_history to read the full DM thread."""
+    resolved_id = await resolve_user_id(user)
+    if resolved_id == user and not re.match(r'^[UW][A-Z0-9]+$', user):
+        return {"error": f"Could not resolve user '{user}' to a Slack user ID"}
+
+    url = f"{SLACK_API_BASE}/conversations.open"
+    payload = {"users": resolved_id, "return_dm": True}
+    data = await make_request(url, payload=payload)
+
+    if data and data.get("ok"):
+        channel = data.get("channel", {})
+        channel_id = channel.get("id") if isinstance(channel, dict) else None
+        if channel_id:
+            handle = await get_user_handle(resolved_id)
+            return {"channel_id": channel_id, "user_id": resolved_id, "user": handle}
+
+    error = data.get("error", "Unknown error") if data else "No response"
+    return {"error": f"Could not open DM channel: {error}"}
+
+
+@mcp.tool()
 async def post_message(
     channel_id: str, message: str, thread_ts: str = "", skip_log: bool = False
 ) -> bool:
