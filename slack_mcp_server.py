@@ -503,21 +503,18 @@ async def _search_channels(query: str, only_member: bool = True) -> list[dict[st
     return results
 
 
-async def _load_channels_to_cache() -> bool:
-    """Load channels into the cache. Uses conversations.list with cursor-based
-    pagination, falling back to search.modules on Enterprise Grid workspaces
-    where conversations.list is restricted."""
-    global _channel_cache
-
+async def _fetch_all_channels() -> list[dict[str, Any]] | None:
+    """Paginate conversations.list and return all raw channel objects.
+    Returns None if the API is unavailable (caller should fall back or return empty)."""
     url = f"{SLACK_API_BASE}/conversations.list"
-    _channel_cache.clear()
+    all_channels: list[dict[str, Any]] = []
     cursor = None
 
     while True:
         payload: dict[str, str] = {
             "exclude_archived": "true",
             "types": "public_channel,private_channel",
-            "limit": "1000",
+            "limit": "200",
         }
         if cursor:
             payload["cursor"] = cursor
@@ -526,18 +523,35 @@ async def _load_channels_to_cache() -> bool:
 
         if not data or not data.get("ok"):
             error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
-            print(f"conversations.list unavailable ({error_msg}), using search.modules fallback")
-            return False
+            print(f"conversations.list unavailable ({error_msg})")
+            return None
 
-        for channel in data.get("channels", []):
-            channel_name = channel.get("name", "")
-            channel_id = channel.get("id", "")
-            if channel_name and channel_id:
-                _channel_cache[channel_name] = channel_id
-
+        all_channels.extend(data.get("channels", []))
         cursor = data.get("response_metadata", {}).get("next_cursor")
         if not cursor:
             break
+
+    return all_channels
+
+
+async def _load_channels_to_cache() -> bool:
+    """Load channels into the cache. Uses conversations.list with cursor-based
+    pagination, falling back to search.modules on Enterprise Grid workspaces
+    where conversations.list is restricted."""
+    global _channel_cache
+
+    _channel_cache.clear()
+    channels = await _fetch_all_channels()
+
+    if channels is None:
+        print("conversations.list unavailable, using search.modules fallback")
+        return False
+
+    for channel in channels:
+        channel_name = channel.get("name", "")
+        channel_id = channel.get("id", "")
+        if channel_name and channel_id:
+            _channel_cache[channel_name] = channel_id
 
     print(f"Loaded {len(_channel_cache)} channels into cache")
     return True
@@ -609,42 +623,18 @@ async def get_unread_channels(limit: int = 50) -> list[dict[str, Any]]:
     Returns channel ID, name, and unread count for channels where unread_count > 0.
     Supports an optional limit param (default 50)."""
     await log_to_slack(f"Getting unread channels (limit: {limit})")
-    url = f"{SLACK_API_BASE}/conversations.list"
-    all_channels = []
-    cursor = None
-
-    while True:
-        payload: dict[str, str] = {
-            "exclude_archived": "true",
-            "types": "public_channel,private_channel",
-            "limit": "200",
-        }
-        if cursor:
-            payload["cursor"] = cursor
-
-        data = await make_request(url, method="GET", payload=payload)
-
-        if not data or not data.get("ok"):
-            error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
-            print(f"get_unread_channels: conversations.list failed ({error_msg})")
-            return []
-
-        all_channels.extend(data.get("channels", []))
-        cursor = data.get("response_metadata", {}).get("next_cursor")
-        if not cursor:
-            break
-
-    unread = [
-        {
-            "id": c.get("id", ""),
-            "name": c.get("name", ""),
-            "unread_count": c.get("unread_count", 0),
-        }
-        for c in all_channels
-        if c.get("is_member", False) and c.get("unread_count", 0) > 0
-    ]
-    unread.sort(key=lambda x: x["unread_count"], reverse=True)
-    return unread[:limit]
+    channels = await _fetch_all_channels()
+    if not channels:
+        return []
+    return sorted(
+        [
+            {"id": c.get("id", ""), "name": c.get("name", ""), "unread_count": c.get("unread_count", 0)}
+            for c in channels
+            if c.get("is_member", False) and c.get("unread_count", 0) > 0
+        ],
+        key=lambda x: x["unread_count"],
+        reverse=True,
+    )[:limit]
 
 
 @mcp.tool()
@@ -856,18 +846,13 @@ async def search_messages(
     - before: only messages before this date (YYYY-MM-DD)
 
     Existing callers using raw query strings continue to work unchanged."""
-    parts = []
-    if channel:
-        parts.append(f"in:#{channel.lstrip('#')}")
-    if from_user:
-        parts.append(f"from:@{from_user.lstrip('@')}")
-    if after:
-        parts.append(f"after:{after}")
-    if before:
-        parts.append(f"before:{before}")
-    if query:
-        parts.append(query)
-    full_query = " ".join(parts)
+    full_query = " ".join(filter(None, [
+        f"in:#{channel.lstrip('#')}" if channel else None,
+        f"from:@{from_user.lstrip('@')}" if from_user else None,
+        f"after:{after}" if after else None,
+        f"before:{before}" if before else None,
+        query or None,
+    ]))
 
     await log_to_slack(f"Searching for messages: {full_query} (limit: {limit})")
     url = f"{SLACK_API_BASE}/search.messages"
