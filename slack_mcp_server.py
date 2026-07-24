@@ -604,6 +604,50 @@ async def list_channels(query: str = "", only_member: bool = True) -> list[dict[
 
 
 @mcp.tool()
+async def get_unread_channels(limit: int = 50) -> list[dict[str, Any]]:
+    """Get channels with unread messages, sorted by unread count descending.
+    Returns channel ID, name, and unread count for channels where unread_count > 0.
+    Supports an optional limit param (default 50)."""
+    await log_to_slack(f"Getting unread channels (limit: {limit})")
+    url = f"{SLACK_API_BASE}/conversations.list"
+    all_channels = []
+    cursor = None
+
+    while True:
+        payload: dict[str, str] = {
+            "exclude_archived": "true",
+            "types": "public_channel,private_channel",
+            "limit": "200",
+        }
+        if cursor:
+            payload["cursor"] = cursor
+
+        data = await make_request(url, method="GET", payload=payload)
+
+        if not data or not data.get("ok"):
+            error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
+            print(f"get_unread_channels: conversations.list failed ({error_msg})")
+            return []
+
+        all_channels.extend(data.get("channels", []))
+        cursor = data.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    unread = [
+        {
+            "id": c.get("id", ""),
+            "name": c.get("name", ""),
+            "unread_count": c.get("unread_count", 0),
+        }
+        for c in all_channels
+        if c.get("is_member", False) and c.get("unread_count", 0) > 0
+    ]
+    unread.sort(key=lambda x: x["unread_count"], reverse=True)
+    return unread[:limit]
+
+
+@mcp.tool()
 async def refresh_user_cache() -> int:
     """Clear the user cache. Use this when user handles are outdated or if user lookups are failing. Returns the number of cached entries cleared."""
     global _user_cache, _user_name_cache
@@ -795,10 +839,37 @@ async def send_dm(user_id: str, message: str) -> bool:
 
 @mcp.tool()
 async def search_messages(
-    query: str, sort: Literal["timestamp", "score"] = "timestamp", limit: int = 1000
+    query: str = "",
+    sort: Literal["timestamp", "score"] = "timestamp",
+    limit: int = 1000,
+    channel: str = "",
+    from_user: str = "",
+    after: str = "",
+    before: str = "",
 ) -> list[dict[str, Any] | str]:
-    """Search for messages in the workspace with pagination support. Limit parameter controls max results to fetch (default 1000)."""
-    await log_to_slack(f"Searching for messages: {query} (limit: {limit})")
+    """Search for messages in the workspace with pagination support. Limit parameter controls max results to fetch (default 1000).
+
+    Optional structured filter params (combined with query into valid Slack search syntax):
+    - channel: channel name to restrict search to (e.g. "design-systems" or "#design-systems")
+    - from_user: handle to restrict to messages from a specific user (e.g. "tnolan" or "@tnolan")
+    - after: only messages after this date (YYYY-MM-DD)
+    - before: only messages before this date (YYYY-MM-DD)
+
+    Existing callers using raw query strings continue to work unchanged."""
+    parts = []
+    if channel:
+        parts.append(f"in:#{channel.lstrip('#')}")
+    if from_user:
+        parts.append(f"from:@{from_user.lstrip('@')}")
+    if after:
+        parts.append(f"after:{after}")
+    if before:
+        parts.append(f"before:{before}")
+    if query:
+        parts.append(query)
+    full_query = " ".join(parts)
+
+    await log_to_slack(f"Searching for messages: {full_query} (limit: {limit})")
     url = f"{SLACK_API_BASE}/search.messages"
 
     all_matches = []
@@ -806,7 +877,7 @@ async def search_messages(
 
     while len(all_matches) < limit:
         payload = {
-            "query": query,
+            "query": full_query,
             "sort": sort,
             "count": min(100, limit - len(all_matches)),  # Slack max is 100 per page
             "page": page
@@ -830,7 +901,7 @@ async def search_messages(
 
         page += 1
 
-    print(f"Retrieved {len(all_matches)} search results for query: {query}")
+    print(f"Retrieved {len(all_matches)} search results for query: {full_query}")
 
     # Pre-fetch all unique user handles to avoid duplicate API calls
     # Include both message authors and users mentioned in text
