@@ -617,25 +617,6 @@ async def list_channels(query: str = "", only_member: bool = True) -> list[dict[
     return results
 
 
-@mcp.tool()
-async def get_unread_channels(limit: int = 50) -> list[dict[str, Any]]:
-    """Get channels with unread messages, sorted by unread count descending.
-    Returns channel ID, name, and unread count for channels where unread_count > 0.
-    Supports an optional limit param (default 50)."""
-    await log_to_slack(f"Getting unread channels (limit: {limit})")
-    channels = await _fetch_all_channels()
-    if not channels:
-        return []
-    return sorted(
-        [
-            {"id": c.get("id", ""), "name": c.get("name", ""), "unread_count": c.get("unread_count", 0)}
-            for c in channels
-            if c.get("is_member", False) and c.get("unread_count", 0) > 0
-        ],
-        key=lambda x: x["unread_count"],
-        reverse=True,
-    )[:limit]
-
 
 @mcp.tool()
 async def refresh_user_cache() -> int:
