@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Any, Literal
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -80,6 +81,11 @@ async def make_request(
 
 async def log_to_slack(message: str):
     await post_message(LOGS_CHANNEL_ID, message, skip_log=True)
+
+
+def log_read_operation(message: str) -> None:
+    """Log read-only diagnostics locally without creating Slack activity."""
+    print(f"[slack-mcp read] {message}", file=sys.stderr)
 
 
 def parse_timestamp(date_str: str, is_end_of_range: bool = False) -> str:
@@ -408,7 +414,7 @@ async def get_channel_history(
 
     Note: For date-only formats, 'oldest' defaults to start of day (00:00:00) and 'latest' to end of day (23:59:59).
     """
-    await log_to_slack(f"Getting history of channel <#{channel_id}> (limit: {limit}, include_threads: {include_threads})")
+    log_read_operation(f"Getting history of channel <#{channel_id}> (limit: {limit}, include_threads: {include_threads})")
     url = f"{SLACK_API_BASE}/conversations.history"
 
     # Parse timestamp parameters
@@ -562,7 +568,7 @@ async def get_channel_id_by_name(channel_name: str) -> str:
     """Get the channel ID by channel name. The channel name can be with or without the # prefix."""
     # Remove # prefix if present
     clean_name = channel_name.lstrip("#")
-    await log_to_slack(f"Looking up channel ID for channel name: {clean_name}")
+    log_read_operation(f"Looking up channel ID for channel name: {clean_name}")
 
     # Check cache first
     if clean_name in _channel_cache:
@@ -588,7 +594,7 @@ async def get_channel_id_by_name(channel_name: str) -> str:
 @mcp.tool()
 async def refresh_channel_cache() -> bool:
     """Refresh the channel cache. Use this when new channels are created or if channel lookups are failing."""
-    await log_to_slack("Refreshing channel cache")
+    log_read_operation("Refreshing channel cache")
     return await _load_channels_to_cache()
 
 
@@ -597,7 +603,7 @@ async def list_channels(query: str = "", only_member: bool = True) -> list[dict[
     """List channels in the workspace. Optionally filter by keyword (matches against channel name).
     Returns a list of channels with their ID and name. Use this to find channels when you don't know the exact name.
     Set only_member=False to include channels you haven't joined."""
-    await log_to_slack(f"Listing channels (query: '{query}', only_member: {only_member})")
+    log_read_operation(f"Listing channels (query: '{query}', only_member: {only_member})")
 
     # If a query is provided, use search.modules directly (works on Enterprise Grid)
     if query:
@@ -622,7 +628,7 @@ async def list_channels(query: str = "", only_member: bool = True) -> list[dict[
 async def refresh_user_cache() -> int:
     """Clear the user cache. Use this when user handles are outdated or if user lookups are failing. Returns the number of cached entries cleared."""
     global _user_cache, _user_name_cache
-    await log_to_slack("Clearing user cache")
+    log_read_operation("Clearing user cache")
     count = len(_user_cache)
     _user_cache.clear()
     _user_name_cache.clear()
@@ -644,7 +650,7 @@ async def refresh_user_cache() -> int:
 async def search_users(query: str) -> list[dict[str, str]]:
     """Search for users by name, handle, or username. Returns matching users with their ID, handle, and username.
     Use this to find the correct user when a DM or mention fails, or when you're unsure of someone's exact Slack handle."""
-    await log_to_slack(f"Searching for users: {query}")
+    log_read_operation(f"Searching for users: {query}")
 
     # Ensure caches are populated
     if not _user_name_cache:
@@ -669,7 +675,7 @@ async def search_users(query: str) -> list[dict[str, str]]:
 async def list_dms(limit: int = 50) -> list[dict[str, str]]:
     """List your direct message conversations, sorted by most recent activity.
     Returns DM channel IDs and the other user's handle. Use get_channel_history with the returned channel ID to read DM messages."""
-    await log_to_slack(f"Listing DMs (limit: {limit})")
+    log_read_operation(f"Listing DMs (limit: {limit})")
     url = f"{SLACK_API_BASE}/conversations.list"
     payload = {"types": "im", "limit": min(limit, 200)}
 
@@ -696,14 +702,18 @@ async def list_dms(limit: int = 50) -> list[dict[str, str]]:
 
 @mcp.tool()
 async def get_dm_channel(user: str) -> dict[str, str]:
-    """Get the DM channel ID for a specific user. Accepts a Slack handle, display name, or user ID.
-    Use the returned channel_id with get_channel_history to read the full DM thread."""
+    """Get an existing DM channel ID without creating a conversation.
+
+    Accepts a Slack handle, display name, or user ID. Use the returned
+    channel_id with get_channel_history to read the full DM thread.
+    """
     resolved_id = await resolve_user_id(user)
     if resolved_id == user and not re.match(r'^[UW][A-Z0-9]+$', user):
         return {"error": f"Could not resolve user '{user}' to a Slack user ID"}
 
+    log_read_operation(f"Looking up existing DM channel for user <@{resolved_id}>")
     url = f"{SLACK_API_BASE}/conversations.open"
-    payload = {"users": resolved_id, "return_dm": True}
+    payload = {"users": resolved_id, "return_dm": True, "prevent_creation": True}
     data = await make_request(url, payload=payload)
 
     if data and data.get("ok"):
@@ -714,7 +724,7 @@ async def get_dm_channel(user: str) -> dict[str, str]:
             return {"channel_id": channel_id, "user_id": resolved_id, "user": handle}
 
     error = data.get("error", "Unknown error") if data else "No response"
-    return {"error": f"Could not open DM channel: {error}"}
+    return {"error": f"Could not find existing DM channel: {error}"}
 
 
 @mcp.tool()
@@ -768,7 +778,7 @@ async def add_reaction(channel_id: str, message_ts: str, reaction: str) -> bool:
 @mcp.tool()
 async def whoami() -> str:
     """Checks authentication & identity."""
-    await log_to_slack("Checking authentication & identity")
+    log_read_operation("Checking authentication & identity")
     url = f"{SLACK_API_BASE}/auth.test"
     data = await make_request(url)
     return data.get("user")
@@ -835,7 +845,7 @@ async def search_messages(
         query or None,
     ]))
 
-    await log_to_slack(f"Searching for messages: {full_query} (limit: {limit})")
+    log_read_operation(f"Searching for messages: {full_query} (limit: {limit})")
     url = f"{SLACK_API_BASE}/search.messages"
 
     all_matches = []
